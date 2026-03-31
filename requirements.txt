@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+httpx
+Pillow
+opencv-python-headless
+pydantic-settings
