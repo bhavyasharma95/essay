@@ -1,11 +1,7 @@
 services:
   - type: web
     name: essay
-    runtime: python
-    buildCommand: |
-      apt-get install -y fonts-noto-core fonts-noto-extra fonts-lohit-deva &&
-      pip install -r requirements.txt
-    startCommand: python -m uvicorn main:app --host 0.0.0.0 --port $PORT
+    runtime: docker
     envVars:
       - key: SUPABASE_URL
         sync: false
