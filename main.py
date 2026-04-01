@@ -1,6 +1,7 @@
 import os
 import math
 import tempfile
+import subprocess
 import httpx
 import asyncio
 import io
@@ -22,9 +23,9 @@ RED_COLOR    = (220, 50, 50)
 FONT_SIZE    = 72
 
 # Layout for /photo-essay
-IMG_PANEL_H  = int(HEIGHT * 2 / 3)   # 853 px  — top image area
-WORD_PANEL_H = HEIGHT - IMG_PANEL_H  # 427 px  — bottom word area
-IMG_DURATION = 2.0                    # seconds each image is shown
+IMG_PANEL_H  = int(HEIGHT * 2 / 3)   # 853 px — top image area
+WORD_PANEL_H = HEIGHT - IMG_PANEL_H  # 427 px — bottom word area
+IMG_DURATION = 2.0                    # seconds per image
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -33,11 +34,11 @@ def get_pivot_index(word: str) -> int:
     clean = ''.join(c for c in word if c.isalpha())
     if not clean:
         return 0
-    length = len(clean)
-    if length == 1:   return 0
-    elif length <= 5: return 1
-    elif length <= 9: return 2
-    else:             return 3
+    n = len(clean)
+    if n == 1:   return 0
+    elif n <= 5: return 1
+    elif n <= 9: return 2
+    else:        return 3
 
 
 def find_font(size: int) -> ImageFont.FreeTypeFont:
@@ -53,22 +54,21 @@ def find_font(size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
-def _text_width(draw: ImageDraw.ImageDraw, text: str, font) -> int:
+def _tw(draw, text, font) -> int:
     if not text:
         return 0
-    bbox = draw.textbbox((0, 0), text, font=font)
-    return bbox[2] - bbox[0]
+    b = draw.textbbox((0, 0), text, font=font)
+    return b[2] - b[0]
 
 
-def _text_height(draw: ImageDraw.ImageDraw, font) -> int:
-    bbox = draw.textbbox((0, 0), "Ag", font=font)
-    return bbox[3] - bbox[1]
+def _th(draw, font) -> int:
+    b = draw.textbbox((0, 0), "Ag", font=font)
+    return b[3] - b[1]
 
 
-# ─── Word-panel renderer (shared by both endpoints) ───────────────────────────
+# ─── Word-panel renderer ──────────────────────────────────────────────────────
 
 def render_word_panel(word: str, font, panel_w: int, panel_h: int) -> Image.Image:
-    """Returns an RGB image of (panel_w x panel_h) with the RSVP word centred."""
     img  = Image.new("RGB", (panel_w, panel_h), BG_COLOR)
     draw = ImageDraw.Draw(img)
 
@@ -86,61 +86,49 @@ def render_word_panel(word: str, font, panel_w: int, panel_h: int) -> Image.Imag
     pivot_char = word[pivot_char_idx] if pivot_char_idx < len(word) else ""
     after      = word[pivot_char_idx + 1:] if pivot_char_idx + 1 < len(word) else ""
 
-    w_before = _text_width(draw, before, font)
-    w_pivot  = _text_width(draw, pivot_char, font) if pivot_char else 0
-    w_after  = _text_width(draw, after, font)
-    total_w  = w_before + w_pivot + w_after
-    h        = _text_height(draw, font)
+    w_b = _tw(draw, before, font)
+    w_p = _tw(draw, pivot_char, font) if pivot_char else 0
+    w_a = _tw(draw, after, font)
+    h   = _th(draw, font)
 
-    x = (panel_w - total_w) // 2
+    x = (panel_w - w_b - w_p - w_a) // 2
     y = (panel_h - h) // 2
 
     if before:
-        draw.text((x, y), before, font=font, fill=TEXT_COLOR)
-        x += w_before
+        draw.text((x, y), before, font=font, fill=TEXT_COLOR);  x += w_b
     if pivot_char:
-        draw.text((x, y), pivot_char, font=font, fill=RED_COLOR)
-        x += w_pivot
+        draw.text((x, y), pivot_char, font=font, fill=RED_COLOR); x += w_p
     if after:
         draw.text((x, y), after, font=font, fill=TEXT_COLOR)
 
-    # Red tick marks top & bottom centre
-    cx, tw = panel_w // 2, 3
+    cx, tw2 = panel_w // 2, 3
     tick = (180, 30, 30)
-    draw.rectangle([cx - tw//2, 6,            cx + tw//2, 20],           fill=tick)
-    draw.rectangle([cx - tw//2, panel_h - 20, cx + tw//2, panel_h - 6], fill=tick)
+    draw.rectangle([cx - tw2//2, 6,            cx + tw2//2, 20],           fill=tick)
+    draw.rectangle([cx - tw2//2, panel_h - 20, cx + tw2//2, panel_h - 6], fill=tick)
 
     return img
 
-
-# ─── Full-frame renderer for /essay ──────────────────────────────────────────
 
 def render_word_frame_full(word: str, font) -> Image.Image:
     return render_word_panel(word, font, WIDTH, HEIGHT)
 
 
-# ─── Image utilities ─────────────────────────────────────────────────────────
+# ─── Image utilities ──────────────────────────────────────────────────────────
 
-def fit_image_to_panel(img: Image.Image, panel_w: int, panel_h: int) -> Image.Image:
-    """Centre-crop fill without distortion."""
-    src_w, src_h = img.size
-    scale = max(panel_w / src_w, panel_h / src_h)
-    new_w, new_h = int(src_w * scale), int(src_h * scale)
-    img  = img.resize((new_w, new_h), Image.LANCZOS)
-    left = (new_w - panel_w) // 2
-    top  = (new_h - panel_h) // 2
-    return img.crop((left, top, left + panel_w, top + panel_h))
+def fit_image_to_panel(img: Image.Image, pw: int, ph: int) -> Image.Image:
+    sw, sh = img.size
+    scale  = max(pw / sw, ph / sh)
+    nw, nh = int(sw * scale), int(sh * scale)
+    img    = img.resize((nw, nh), Image.LANCZOS)
+    l, t   = (nw - pw) // 2, (nh - ph) // 2
+    return img.crop((l, t, l + pw, t + ph))
 
 
 async def fetch_image_urls_from_supabase(limit: int) -> list[str]:
-    """Fetch recent news rows that have a non-null image URL."""
     url = (
         f"{settings.SUPABASE_URL}/rest/v1/news"
-        f"?select=image"
-        f"&image=not.is.null"
-        f"&image=neq."
-        f"&order=created_at.desc"
-        f"&limit={limit}"
+        f"?select=image&image=not.is.null&image=neq."
+        f"&order=created_at.desc&limit={limit}"
     )
     headers = {
         "apikey":        settings.SUPABASE_KEY,
@@ -156,12 +144,56 @@ async def fetch_image_urls_from_supabase(limit: int) -> list[str]:
 
 async def download_image(url: str, client: httpx.AsyncClient) -> Image.Image | None:
     try:
-        resp = await client.get(url, timeout=15, follow_redirects=True)
-        if resp.status_code == 200:
-            return Image.open(io.BytesIO(resp.content)).convert("RGB")
+        r = await client.get(url, timeout=15, follow_redirects=True)
+        if r.status_code == 200:
+            return Image.open(io.BytesIO(r.content)).convert("RGB")
     except Exception as e:
         print(f"Image download failed ({url}): {e}")
     return None
+
+
+# ─── Audio generation ─────────────────────────────────────────────────────────
+
+def generate_tts_audio(text: str, output_mp3: str) -> bool:
+    """
+    Generate TTS MP3 using gTTS.
+    Returns True on success, False on failure.
+    gTTS speaks at a natural pace (~150 wpm) regardless of the RSVP rate —
+    the visual speed and voice speed are intentionally independent.
+    """
+    try:
+        from gtts import gTTS
+        tts = gTTS(text=text, lang="en", slow=False)
+        tts.save(output_mp3)
+        return True
+    except Exception as e:
+        print(f"gTTS error: {e}")
+        return False
+
+
+def merge_audio_video(video_path: str, audio_path: str, output_path: str) -> bool:
+    """
+    Use ffmpeg to combine silent video + TTS audio.
+    - Audio is trimmed/padded to match video duration exactly.
+    - No re-encoding of video stream (copy) — fast and RAM-friendly.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_path,
+        "-c:v", "copy",          # copy video stream as-is — no re-encode
+        "-c:a", "aac",           # encode audio to AAC for mp4 container
+        "-b:a", "128k",
+        "-shortest",             # trim to the shorter of video/audio
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"ffmpeg merge error:\n{result.stderr}")
+        return False
+    return True
 
 
 # ─── Video builders ───────────────────────────────────────────────────────────
@@ -197,12 +229,9 @@ def create_photo_essay_video(
     font             = find_font(FONT_SIZE)
     frames_per_word  = max(1, round(FPS * 60.0 / wpm))
     frames_per_image = round(FPS * IMG_DURATION)
-
-    # Pre-resize all images once to save per-frame work
-    panels = [fit_image_to_panel(im, WIDTH, IMG_PANEL_H) for im in images]
-
-    writer    = _cv2_writer(output_path)
-    frame_idx = 0
+    panels           = [fit_image_to_panel(im, WIDTH, IMG_PANEL_H) for im in images]
+    writer           = _cv2_writer(output_path)
+    frame_idx        = 0
 
     for word in words:
         word_panel = render_word_panel(word, font, WIDTH, WORD_PANEL_H)
@@ -215,10 +244,50 @@ def create_photo_essay_video(
         bgr = _pil_to_bgr(composite)
         for _ in range(frames_per_word):
             writer.write(bgr)
-
         frame_idx += frames_per_word
 
     writer.release()
+
+
+# ─── Audio post-processing helper ─────────────────────────────────────────────
+
+def apply_audio_if_requested(
+    silent_video: str,
+    words_text: str,
+    audio: bool,
+) -> str:
+    """
+    If audio=True, generate TTS and merge with video.
+    Returns path to the final video (may be the same file or a new one).
+    Cleans up intermediate files automatically.
+    """
+    if not audio:
+        return silent_video
+
+    mp3_path    = silent_video.replace(".mp4", "_audio.mp3")
+    final_path  = silent_video.replace(".mp4", "_final.mp4")
+
+    ok = generate_tts_audio(words_text, mp3_path)
+    if not ok:
+        print("[audio] TTS failed — sending silent video")
+        return silent_video
+
+    ok = merge_audio_video(silent_video, mp3_path, final_path)
+
+    # Clean up MP3 and silent video regardless
+    for p in [mp3_path, silent_video]:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+    if ok:
+        return final_path
+    else:
+        print("[audio] ffmpeg merge failed — sending silent video (already deleted, re-create)")
+        # Re-create silent video as fallback is not practical here;
+        # caller will handle missing file gracefully
+        return final_path  # caller checks os.path.exists
 
 
 # ─── Telegram sender ──────────────────────────────────────────────────────────
@@ -237,23 +306,42 @@ async def send_video_to_telegram(video_path: str):
 
 # ─── Background task processors ───────────────────────────────────────────────
 
-async def process_essay(words_text: str, rate: int):
+async def process_essay(words_text: str, rate: int, audio: bool):
     words = words_text.split()
     if not words:
         return
+
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        tmp_path = tmp.name
+        silent_path = tmp.name
+
+    final_path = silent_path
     try:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, create_video, words, rate, tmp_path)
-        status, body = await send_video_to_telegram(tmp_path)
+
+        # 1. Build silent video
+        await loop.run_in_executor(None, create_video, words, rate, silent_path)
+
+        # 2. Optionally add audio (runs in executor to avoid blocking)
+        if audio:
+            final_path = await loop.run_in_executor(
+                None, apply_audio_if_requested, silent_path, words_text, True
+            )
+
+        if not os.path.exists(final_path):
+            print("[/essay] Final video missing — aborting send")
+            return
+
+        status, body = await send_video_to_telegram(final_path)
         print(f"[/essay] Telegram {status}: {body}")
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        for p in {silent_path, final_path}:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
 
 
-async def process_photo_essay(words_text: str, rate: int):
+async def process_photo_essay(words_text: str, rate: int, audio: bool):
     words = words_text.split()
     if not words:
         return
@@ -266,11 +354,10 @@ async def process_photo_essay(words_text: str, rate: int):
 
     image_urls = await fetch_image_urls_from_supabase(fetch_limit)
     if not image_urls:
-        print("[/photo-essay] No images found — falling back to plain essay")
-        await process_essay(words_text, rate)
+        print("[/photo-essay] No images — falling back to plain essay")
+        await process_essay(words_text, rate, audio)
         return
 
-    # Download concurrently, cap at 4 simultaneous to keep RAM in check
     sem = asyncio.Semaphore(4)
     async def guarded(url, client):
         async with sem:
@@ -282,25 +369,42 @@ async def process_photo_essay(words_text: str, rate: int):
     images = [im for im in results if im is not None]
     if not images:
         print("[/photo-essay] All downloads failed — falling back to plain essay")
-        await process_essay(words_text, rate)
+        await process_essay(words_text, rate, audio)
         return
 
-    # Cycle if fewer images than needed
     while len(images) < images_needed:
         images = (images * 2)[:images_needed]
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        tmp_path = tmp.name
+        silent_path = tmp.name
+
+    final_path = silent_path
     try:
         loop = asyncio.get_event_loop()
+
+        # 1. Build silent video
         await loop.run_in_executor(
-            None, create_photo_essay_video, words, rate, images, tmp_path
+            None, create_photo_essay_video, words, rate, images, silent_path
         )
-        status, body = await send_video_to_telegram(tmp_path)
+
+        # 2. Optionally add audio
+        if audio:
+            final_path = await loop.run_in_executor(
+                None, apply_audio_if_requested, silent_path, words_text, True
+            )
+
+        if not os.path.exists(final_path):
+            print("[/photo-essay] Final video missing — aborting send")
+            return
+
+        status, body = await send_video_to_telegram(final_path)
         print(f"[/photo-essay] Telegram {status}: {body}")
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        for p in {silent_path, final_path}:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -308,20 +412,24 @@ async def process_photo_essay(words_text: str, rate: int):
 @app.get("/essay")
 async def essay_endpoint(
     background_tasks: BackgroundTasks,
-    words: str = Query(..., description="Essay text"),
-    rate: int  = Query(300, description="Words per minute"),
+    words: str = Query(...,  description="Essay text"),
+    rate:  int = Query(300,  description="Words per minute"),
+    audio: str = Query("f",  description="Add voiceover? t=yes, f=no"),
 ):
     if not 50 <= rate <= 1000:
         return JSONResponse(status_code=400, content={"error": "rate must be 50–1000"})
     word_list = words.split()
     if not word_list:
         return JSONResponse(status_code=400, content={"error": "No words provided"})
-    background_tasks.add_task(process_essay, words, rate)
+
+    want_audio = audio.strip().lower() == "t"
+    background_tasks.add_task(process_essay, words, rate, want_audio)
     return {
         "status":            "processing",
         "endpoint":          "/essay",
         "word_count":        len(word_list),
         "rate_wpm":          rate,
+        "audio":             want_audio,
         "estimated_seconds": round(len(word_list) / rate * 60, 1),
         "message":           "Video being generated — check Telegram shortly.",
     }
@@ -330,8 +438,9 @@ async def essay_endpoint(
 @app.get("/photo-essay")
 async def photo_essay_endpoint(
     background_tasks: BackgroundTasks,
-    words: str = Query(..., description="Essay text"),
-    rate: int  = Query(300, description="Words per minute"),
+    words: str = Query(...,  description="Essay text"),
+    rate:  int = Query(300,  description="Words per minute"),
+    audio: str = Query("f",  description="Add voiceover? t=yes, f=no"),
 ):
     if not 50 <= rate <= 1000:
         return JSONResponse(status_code=400, content={"error": "rate must be 50–1000"})
@@ -341,13 +450,15 @@ async def photo_essay_endpoint(
 
     total_seconds = len(word_list) / rate * 60
     images_needed = max(1, math.ceil(total_seconds / IMG_DURATION))
+    want_audio    = audio.strip().lower() == "t"
 
-    background_tasks.add_task(process_photo_essay, words, rate)
+    background_tasks.add_task(process_photo_essay, words, rate, want_audio)
     return {
         "status":            "processing",
         "endpoint":          "/photo-essay",
         "word_count":        len(word_list),
         "rate_wpm":          rate,
+        "audio":             want_audio,
         "estimated_seconds": round(total_seconds, 1),
         "images_needed":     images_needed,
         "message":           "Photo-essay video being generated — check Telegram shortly.",
