@@ -31,6 +31,30 @@ IMG_DURATION = 2.0                    # seconds per image
 KB_ZOOM_START = 1.0
 KB_ZOOM_END   = 1.08
 
+# ─── Supported gTTS language codes ────────────────────────────────────────────
+# Full list: https://gtts.readthedocs.io/en/latest/module.html#languages-gtts-lang
+SUPPORTED_AUDIO_LANGS = {
+    "en": "English",
+    "hi": "Hindi",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "ar": "Arabic",
+    "zh": "Chinese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "it": "Italian",
+    "bn": "Bengali",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "mr": "Marathi",
+    "gu": "Gujarati",
+    "ur": "Urdu",
+}
+DEFAULT_AUDIO_LANG = "en"
+
 
 # ─── Phrase grouper ───────────────────────────────────────────────────────────
 
@@ -44,12 +68,11 @@ def group_into_phrases(words: list[str], max_words: int = 3) -> list[str]:
     phrases = []
     i = 0
     while i < len(words):
-        # Decide chunk size based on length of the first word in this group
         first = words[i]
         if len(first) <= 3:
-            chunk = max_words          # allow up to 3 for short anchor words
+            chunk = max_words
         else:
-            chunk = min(2, max_words)  # cap at 2 for longer words
+            chunk = min(2, max_words)
 
         group = words[i : i + chunk]
         phrases.append(" ".join(group))
@@ -60,7 +83,6 @@ def group_into_phrases(words: list[str], max_words: int = 3) -> list[str]:
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def get_pivot_index(word: str) -> int:
-    # For phrase mode the "word" may contain spaces; use the first token for pivot
     first_token = word.split()[0] if " " in word else word
     clean = ''.join(c for c in first_token if c.isalpha())
     if not clean:
@@ -72,13 +94,44 @@ def get_pivot_index(word: str) -> int:
     else:        return 3
 
 
-def find_font(size: int) -> ImageFont.FreeTypeFont:
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-        "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
-    ]
+def find_font(size: int, lang: str = "en") -> ImageFont.FreeTypeFont:
+    """
+    Return a font that can render the given language.
+    For Indic scripts (hi, bn, mr, gu, ta, te, ur, etc.) we prefer
+    a Noto font that covers Devanagari / the relevant Unicode block.
+    Falls back to a Latin font if nothing suitable is found.
+    """
+    # Languages that need Devanagari / Indic font support
+    indic_langs = {"hi", "mr", "ne", "sa", "mai", "kok"}  # Devanagari users
+    other_indic = {"bn", "gu", "ta", "te", "ur", "pa", "si", "km", "lo", "my"}
+
+    if lang in indic_langs:
+        candidates = [
+            # Noto Sans Devanagari (most common Linux package)
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
+            # Older or alternative locations
+            "/usr/share/fonts/noto/NotoSansDevanagari-Regular.ttf",
+            "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf",
+            # Fallback Latin fonts (will show boxes for Devanagari but won't crash)
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ]
+    elif lang in other_indic:
+        candidates = [
+            f"/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ]
+    else:
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+        ]
+
     for path in candidates:
         if os.path.exists(path):
             return ImageFont.truetype(path, size)
@@ -111,7 +164,6 @@ def render_word_panel(word: str, font, panel_w: int, panel_h: int) -> Image.Imag
     is_phrase = " " in word
 
     if is_phrase:
-        # ── Phrase mode: render the full phrase centred, pivot on first token ──
         tokens = word.split()
         first  = tokens[0]
         rest   = " ".join(tokens[1:])
@@ -129,7 +181,6 @@ def render_word_panel(word: str, font, panel_w: int, panel_h: int) -> Image.Imag
         before     = first[:pivot_char_idx]
         pivot_char = first[pivot_char_idx] if pivot_char_idx < len(first) else ""
         after_word = first[pivot_char_idx + 1:] if pivot_char_idx + 1 < len(first) else ""
-        # Add space + rest of phrase after the first token
         after_full = after_word + (" " + rest if rest else "")
 
         w_b = _tw(draw, before, font)
@@ -148,7 +199,6 @@ def render_word_panel(word: str, font, panel_w: int, panel_h: int) -> Image.Imag
             draw.text((x, y), after_full, font=font, fill=TEXT_COLOR)
 
     else:
-        # ── Single-word mode (original logic) ──
         pivot_idx      = get_pivot_index(word)
         alpha_count    = 0
         pivot_char_idx = 0
@@ -209,30 +259,17 @@ def apply_ken_burns(
     panel_w: int,
     panel_h: int,
 ) -> Image.Image:
-    """
-    Apply a slow Ken Burns zoom-in effect to `base_img`.
-
-    `base_img` must already be large enough to allow zooming without black bars
-    (i.e. pre-scaled so its smallest dimension > panel size * KB_ZOOM_END).
-
-    `frame_in_image`  : 0-based frame index within the current image's display window
-    `total_frames_for_image`: total frames this image is displayed
-
-    Returns a (panel_w × panel_h) crop with the zoom applied.
-    """
     if total_frames_for_image <= 1:
         t = 0.0
     else:
-        t = frame_in_image / (total_frames_for_image - 1)  # 0.0 → 1.0
+        t = frame_in_image / (total_frames_for_image - 1)
 
     zoom = KB_ZOOM_START + (KB_ZOOM_END - KB_ZOOM_START) * t
 
     bw, bh = base_img.size
-    # Visible window at this zoom level
     crop_w = int(panel_w / zoom)
     crop_h = int(panel_h / zoom)
 
-    # Keep crop centred (panning can be added here by offsetting cx/cy)
     cx = bw // 2
     cy = bh // 2
     left   = max(0, cx - crop_w // 2)
@@ -240,7 +277,6 @@ def apply_ken_burns(
     right  = left + crop_w
     bottom = top  + crop_h
 
-    # Clamp to image bounds
     right  = min(right,  bw)
     bottom = min(bottom, bh)
 
@@ -249,11 +285,7 @@ def apply_ken_burns(
 
 
 def _prepare_ken_burns_base(img: Image.Image, pw: int, ph: int) -> Image.Image:
-    """
-    Scale the source image so it's large enough for the maximum Ken Burns zoom
-    without introducing black bars. Returns an oversized base image.
-    """
-    margin = KB_ZOOM_END  # need this much extra room
+    margin = KB_ZOOM_END
     sw, sh = img.size
     scale  = max(pw * margin / sw, ph * margin / sh)
     nw, nh = int(sw * scale), int(sh * scale)
@@ -290,10 +322,27 @@ async def download_image(url: str, client: httpx.AsyncClient) -> Image.Image | N
 
 # ─── Audio generation ─────────────────────────────────────────────────────────
 
-def generate_tts_audio(text: str, output_mp3: str) -> bool:
+def generate_tts_audio(text: str, output_mp3: str, lang: str = "en") -> bool:
+    """
+    Generate TTS audio using gTTS.
+
+    Parameters
+    ----------
+    text       : The text to speak.
+    output_mp3 : Destination .mp3 path.
+    lang       : BCP-47 / gTTS language code, e.g. "en", "hi", "es".
+                 Defaults to "en" if the provided code is unsupported.
+    """
     try:
-        from gtts import gTTS
-        tts = gTTS(text=text, lang="en", slow=False)
+        from gtts import gTTS, lang as gtts_lang
+
+        # Validate: fall back to English if the code isn't recognised
+        available = gtts_lang.tts_langs()
+        if lang not in available:
+            print(f"[TTS] Language '{lang}' not supported by gTTS — falling back to 'en'")
+            lang = "en"
+
+        tts = gTTS(text=text, lang=lang, slow=False)
         tts.save(output_mp3)
         return True
     except Exception as e:
@@ -334,9 +383,9 @@ def _cv2_writer(path: str):
     return cv2.VideoWriter(path, fourcc, FPS, (WIDTH, HEIGHT))
 
 
-def create_video(words: list[str], wpm: int, output_path: str):
+def create_video(words: list[str], wpm: int, output_path: str, lang: str = "en"):
     """Plain RSVP video — no images, no Ken Burns."""
-    font            = find_font(FONT_SIZE)
+    font            = find_font(FONT_SIZE, lang)
     frames_per_word = max(1, round(FPS * 60.0 / wpm))
     writer          = _cv2_writer(output_path)
     for word in words:
@@ -351,23 +400,20 @@ def create_photo_essay_video(
     wpm: int,
     images: list[Image.Image],
     output_path: str,
+    lang: str = "en",
 ):
     """
     Photo-essay video with Ken Burns effect on the top image panel.
-
-    Each source image is displayed for IMG_DURATION seconds while slowly
-    zooming in (Ken Burns). The bottom panel shows one word (or phrase) at
-    a time at `wpm` rate.
+    `lang` is used to select the correct font for rendering.
     """
-    font             = find_font(FONT_SIZE)
+    font             = find_font(FONT_SIZE, lang)
     frames_per_word  = max(1, round(FPS * 60.0 / wpm))
     frames_per_image = round(FPS * IMG_DURATION)
 
-    # Pre-scale every image to a base size large enough for Ken Burns zoom
     kb_bases = [_prepare_ken_burns_base(im, WIDTH, IMG_PANEL_H) for im in images]
 
     writer    = _cv2_writer(output_path)
-    frame_idx = 0  # global frame counter used for Ken Burns position
+    frame_idx = 0
 
     for word in words:
         word_panel = render_word_panel(word, font, WIDTH, WORD_PANEL_H)
@@ -377,7 +423,6 @@ def create_photo_essay_video(
             img_idx        = (abs_frame // frames_per_image) % len(kb_bases)
             frame_in_image = abs_frame % frames_per_image
 
-            # Ken Burns crop for this exact frame
             top_panel = apply_ken_burns(
                 kb_bases[img_idx],
                 frame_in_image,
@@ -403,6 +448,7 @@ def apply_audio_if_requested(
     silent_video: str,
     words_text: str,
     audio: bool,
+    audio_lang: str = "en",
 ) -> str:
     if not audio:
         return silent_video
@@ -410,7 +456,7 @@ def apply_audio_if_requested(
     mp3_path   = silent_video.replace(".mp4", "_audio.mp3")
     final_path = silent_video.replace(".mp4", "_final.mp4")
 
-    ok = generate_tts_audio(words_text, mp3_path)
+    ok = generate_tts_audio(words_text, mp3_path, lang=audio_lang)
     if not ok:
         print("[audio] TTS failed — sending silent video")
         return silent_video
@@ -446,12 +492,18 @@ async def send_video_to_telegram(video_path: str):
 
 # ─── Background task processors ───────────────────────────────────────────────
 
-async def process_essay(words_text: str, rate: int, audio: bool, phrase_mode: bool = False):
+async def process_essay(
+    words_text: str,
+    rate: int,
+    audio: bool,
+    phrase_mode: bool = False,
+    audio_lang: str = "en",
+    display_lang: str = "en",
+):
     raw_words = words_text.split()
     if not raw_words:
         return
 
-    # In phrase mode group words; otherwise keep flat list
     display_units = group_into_phrases(raw_words) if phrase_mode else raw_words
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
@@ -460,11 +512,13 @@ async def process_essay(words_text: str, rate: int, audio: bool, phrase_mode: bo
     final_path = silent_path
     try:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, create_video, display_units, rate, silent_path)
+        await loop.run_in_executor(
+            None, create_video, display_units, rate, silent_path, display_lang
+        )
 
         if audio:
             final_path = await loop.run_in_executor(
-                None, apply_audio_if_requested, silent_path, words_text, True
+                None, apply_audio_if_requested, silent_path, words_text, True, audio_lang
             )
 
         if not os.path.exists(final_path):
@@ -486,12 +540,13 @@ async def process_photo_essay(
     rate: int,
     audio: bool,
     phrase_mode: bool = False,
+    audio_lang: str = "en",
+    display_lang: str = "en",
 ):
     raw_words = words_text.split()
     if not raw_words:
         return
 
-    # In phrase mode group words; otherwise keep flat list
     display_units = group_into_phrases(raw_words) if phrase_mode else raw_words
 
     total_seconds = len(raw_words) / rate * 60
@@ -500,13 +555,14 @@ async def process_photo_essay(
 
     print(
         f"[/photo-essay] {len(raw_words)} words @ {rate} wpm → {total_seconds:.1f}s "
-        f"→ need {images_needed} images | phrase_mode={phrase_mode}"
+        f"→ need {images_needed} images | phrase_mode={phrase_mode} | "
+        f"audio_lang={audio_lang} | display_lang={display_lang}"
     )
 
     image_urls = await fetch_image_urls_from_supabase(fetch_limit)
     if not image_urls:
         print("[/photo-essay] No images — falling back to plain essay")
-        await process_essay(words_text, rate, audio, phrase_mode)
+        await process_essay(words_text, rate, audio, phrase_mode, audio_lang, display_lang)
         return
 
     sem = asyncio.Semaphore(4)
@@ -520,7 +576,7 @@ async def process_photo_essay(
     images = [im for im in results if im is not None]
     if not images:
         print("[/photo-essay] All downloads failed — falling back to plain essay")
-        await process_essay(words_text, rate, audio, phrase_mode)
+        await process_essay(words_text, rate, audio, phrase_mode, audio_lang, display_lang)
         return
 
     while len(images) < images_needed:
@@ -534,12 +590,14 @@ async def process_photo_essay(
         loop = asyncio.get_event_loop()
 
         await loop.run_in_executor(
-            None, create_photo_essay_video, display_units, rate, images, silent_path
+            None, create_photo_essay_video,
+            display_units, rate, images, silent_path, display_lang
         )
 
         if audio:
             final_path = await loop.run_in_executor(
-                None, apply_audio_if_requested, silent_path, words_text, True
+                None, apply_audio_if_requested,
+                silent_path, words_text, True, audio_lang
             )
 
         if not os.path.exists(final_path):
@@ -561,10 +619,12 @@ async def process_photo_essay(
 @app.get("/essay")
 async def essay_endpoint(
     background_tasks: BackgroundTasks,
-    words:  str = Query(...,  description="Essay text"),
-    rate:   int = Query(300,  description="Words per minute"),
-    audio:  str = Query("f",  description="Add voiceover? t=yes, f=no"),
-    phrase: str = Query("f",  description="Phrase mode (2-3 words at a time)? t=yes, f=no"),
+    words:       str = Query(...,   description="Essay text (URL-encoded, supports Unicode/Hindi)"),
+    rate:        int = Query(300,   description="Words per minute (50–1000)"),
+    audio:       str = Query("f",   description="Add voiceover? t=yes, f=no"),
+    phrase:      str = Query("f",   description="Phrase mode (2–3 words at a time)? t=yes, f=no"),
+    audiochoice: str = Query("en",  description="gTTS language code for voiceover, e.g. en, hi, es, fr"),
+    displaylang: str = Query("",    description="Font language for rendering text, e.g. en, hi (defaults to audiochoice)"),
 ):
     if not 50 <= rate <= 1000:
         return JSONResponse(status_code=400, content={"error": "rate must be 50–1000"})
@@ -572,16 +632,31 @@ async def essay_endpoint(
     if not word_list:
         return JSONResponse(status_code=400, content={"error": "No words provided"})
 
-    want_audio  = audio.strip().lower()  == "t"
-    phrase_mode = phrase.strip().lower() == "t"
+    want_audio   = audio.strip().lower()  == "t"
+    phrase_mode  = phrase.strip().lower() == "t"
+    audio_lang   = audiochoice.strip().lower() or DEFAULT_AUDIO_LANG
+    display_lang = displaylang.strip().lower() or audio_lang  # default to audiochoice
 
-    background_tasks.add_task(process_essay, words, rate, want_audio, phrase_mode)
+    if audio_lang not in SUPPORTED_AUDIO_LANGS:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"audiochoice '{audio_lang}' not in supported list.",
+                "supported": SUPPORTED_AUDIO_LANGS,
+            },
+        )
+
+    background_tasks.add_task(
+        process_essay, words, rate, want_audio, phrase_mode, audio_lang, display_lang
+    )
     return {
         "status":            "processing",
         "endpoint":          "/essay",
         "word_count":        len(word_list),
         "rate_wpm":          rate,
         "audio":             want_audio,
+        "audio_lang":        audio_lang,
+        "display_lang":      display_lang,
         "phrase_mode":       phrase_mode,
         "estimated_seconds": round(len(word_list) / rate * 60, 1),
         "message":           "Video being generated — check Telegram shortly.",
@@ -591,10 +666,12 @@ async def essay_endpoint(
 @app.get("/photo-essay")
 async def photo_essay_endpoint(
     background_tasks: BackgroundTasks,
-    words:  str = Query(...,  description="Essay text"),
-    rate:   int = Query(300,  description="Words per minute"),
-    audio:  str = Query("f",  description="Add voiceover? t=yes, f=no"),
-    phrase: str = Query("f",  description="Phrase mode (2-3 words at a time)? t=yes, f=no"),
+    words:       str = Query(...,   description="Essay text (URL-encoded, supports Unicode/Hindi)"),
+    rate:        int = Query(300,   description="Words per minute (50–1000)"),
+    audio:       str = Query("f",   description="Add voiceover? t=yes, f=no"),
+    phrase:      str = Query("f",   description="Phrase mode (2–3 words at a time)? t=yes, f=no"),
+    audiochoice: str = Query("en",  description="gTTS language code for voiceover, e.g. en, hi, es, fr"),
+    displaylang: str = Query("",    description="Font language for rendering text, e.g. en, hi (defaults to audiochoice)"),
 ):
     if not 50 <= rate <= 1000:
         return JSONResponse(status_code=400, content={"error": "rate must be 50–1000"})
@@ -602,23 +679,45 @@ async def photo_essay_endpoint(
     if not word_list:
         return JSONResponse(status_code=400, content={"error": "No words provided"})
 
+    want_audio   = audio.strip().lower()  == "t"
+    phrase_mode  = phrase.strip().lower() == "t"
+    audio_lang   = audiochoice.strip().lower() or DEFAULT_AUDIO_LANG
+    display_lang = displaylang.strip().lower() or audio_lang  # default to audiochoice
+
+    if audio_lang not in SUPPORTED_AUDIO_LANGS:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"audiochoice '{audio_lang}' not in supported list.",
+                "supported": SUPPORTED_AUDIO_LANGS,
+            },
+        )
+
     total_seconds = len(word_list) / rate * 60
     images_needed = max(1, math.ceil(total_seconds / IMG_DURATION))
-    want_audio    = audio.strip().lower()  == "t"
-    phrase_mode   = phrase.strip().lower() == "t"
 
-    background_tasks.add_task(process_photo_essay, words, rate, want_audio, phrase_mode)
+    background_tasks.add_task(
+        process_photo_essay, words, rate, want_audio, phrase_mode, audio_lang, display_lang
+    )
     return {
         "status":            "processing",
         "endpoint":          "/photo-essay",
         "word_count":        len(word_list),
         "rate_wpm":          rate,
         "audio":             want_audio,
+        "audio_lang":        audio_lang,
+        "display_lang":      display_lang,
         "phrase_mode":       phrase_mode,
         "estimated_seconds": round(total_seconds, 1),
         "images_needed":     images_needed,
         "message":           "Photo-essay video being generated — check Telegram shortly.",
     }
+
+
+@app.get("/languages")
+async def list_languages():
+    """List all supported audiochoice language codes."""
+    return {"supported_languages": SUPPORTED_AUDIO_LANGS}
 
 
 @app.get("/health")
