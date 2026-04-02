@@ -5,6 +5,7 @@ import subprocess
 import httpx
 import asyncio
 import io
+import urllib.parse
 from fastapi import FastAPI, Query, BackgroundTasks
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageDraw, ImageFont
@@ -31,8 +32,10 @@ IMG_DURATION = 2.0                    # seconds per image
 KB_ZOOM_START = 1.0
 KB_ZOOM_END   = 1.08
 
+# ─── Upstash Redis key ────────────────────────────────────────────────────────
+REDIS_SEEN_IMAGES_KEY = "photo_essay:seen_image_urls"
+
 # ─── Supported gTTS language codes ────────────────────────────────────────────
-# Full list: https://gtts.readthedocs.io/en/latest/module.html#languages-gtts-lang
 SUPPORTED_AUDIO_LANGS = {
     "en": "English",
     "hi": "Hindi",
@@ -56,15 +59,47 @@ SUPPORTED_AUDIO_LANGS = {
 DEFAULT_AUDIO_LANG = "en"
 
 
+# ─── Upstash Redis helpers ────────────────────────────────────────────────────
+
+def _upstash_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {settings.UPSTASH_REDIS_REST_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+async def image_url_is_seen(client: httpx.AsyncClient, url: str) -> bool:
+    """Return True if this image URL was used in a previous job."""
+    try:
+        encoded_url = urllib.parse.quote(url, safe="")
+        r = await client.post(
+            f"{settings.UPSTASH_REDIS_REST_URL}/sismember/{REDIS_SEEN_IMAGES_KEY}/{encoded_url}",
+            headers=_upstash_headers(),
+            timeout=5,
+        )
+        return r.json().get("result") == 1
+    except Exception as e:
+        print(f"[Redis] sismember error (non-fatal): {e}")
+        return False  # fail open — treat as unseen
+
+async def mark_image_urls_seen(client: httpx.AsyncClient, urls: list[str]) -> None:
+    """Add all image URLs to the persistent seen-set via a single SADD call."""
+    if not urls:
+        return
+    try:
+        encoded = "/".join(urllib.parse.quote(u, safe="") for u in urls)
+        r = await client.post(
+            f"{settings.UPSTASH_REDIS_REST_URL}/sadd/{REDIS_SEEN_IMAGES_KEY}/{encoded}",
+            headers=_upstash_headers(),
+            timeout=5,
+        )
+        print(f"[Redis] sadd image URLs result: {r.json()}")
+    except Exception as e:
+        print(f"[Redis] sadd error (non-fatal): {e}")
+
+
 # ─── Phrase grouper ───────────────────────────────────────────────────────────
 
 def group_into_phrases(words: list[str], max_words: int = 3) -> list[str]:
-    """
-    Group a flat word list into display phrases of up to `max_words` words.
-    Short words (≤3 chars) are allowed to push the group to max_words,
-    while longer words keep groups tighter (2 words max).
-    Returns a list of phrase strings.
-    """
     phrases = []
     i = 0
     while i < len(words):
@@ -73,7 +108,6 @@ def group_into_phrases(words: list[str], max_words: int = 3) -> list[str]:
             chunk = max_words
         else:
             chunk = min(2, max_words)
-
         group = words[i : i + chunk]
         phrases.append(" ".join(group))
         i += chunk
@@ -95,25 +129,15 @@ def get_pivot_index(word: str) -> int:
 
 
 def find_font(size: int, lang: str = "en") -> ImageFont.FreeTypeFont:
-    """
-    Return a font that can render the given language.
-    For Indic scripts (hi, bn, mr, gu, ta, te, ur, etc.) we prefer
-    a Noto font that covers Devanagari / the relevant Unicode block.
-    Falls back to a Latin font if nothing suitable is found.
-    """
-    # Languages that need Devanagari / Indic font support
-    indic_langs = {"hi", "mr", "ne", "sa", "mai", "kok"}  # Devanagari users
+    indic_langs = {"hi", "mr", "ne", "sa", "mai", "kok"}
     other_indic = {"bn", "gu", "ta", "te", "ur", "pa", "si", "km", "lo", "my"}
 
     if lang in indic_langs:
         candidates = [
-            # Noto Sans Devanagari (most common Linux package)
             "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
             "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
-            # Older or alternative locations
             "/usr/share/fonts/noto/NotoSansDevanagari-Regular.ttf",
             "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf",
-            # Fallback Latin fonts (will show boxes for Devanagari but won't crash)
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
         ]
@@ -153,11 +177,6 @@ def _th(draw, font) -> int:
 # ─── Word-panel renderer ──────────────────────────────────────────────────────
 
 def render_word_panel(word: str, font, panel_w: int, panel_h: int) -> Image.Image:
-    """
-    Render a word (or phrase) into the bottom panel.
-    For single words: pivot letter highlighted in red (RSVP style).
-    For phrases (contains space): first word gets pivot highlight, rest plain.
-    """
     img  = Image.new("RGB", (panel_w, panel_h), BG_COLOR)
     draw = ImageDraw.Draw(img)
 
@@ -228,7 +247,6 @@ def render_word_panel(word: str, font, panel_w: int, panel_h: int) -> Image.Imag
         if after:
             draw.text((x, y), after, font=font, fill=TEXT_COLOR)
 
-    # Centre tick marks
     cx, tw2 = panel_w // 2, 3
     tick = (180, 30, 30)
     draw.rectangle([cx - tw2//2, 6,            cx + tw2//2, 20],           fill=tick)
@@ -310,6 +328,41 @@ async def fetch_image_urls_from_supabase(limit: int) -> list[str]:
     return [r["image"] for r in resp.json() if r.get("image")]
 
 
+async def fetch_fresh_image_urls(images_needed: int) -> list[str]:
+    """
+    Fetch image URLs from Supabase, skipping any already seen in Redis.
+    Fetches in batches, expanding the limit until we have enough fresh URLs
+    or exhaust available images (capped at 200).
+    """
+    fresh_urls: list[str] = []
+    fetch_limit = min(images_needed + 10, 50)
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        while len(fresh_urls) < images_needed and fetch_limit <= 200:
+            all_urls = await fetch_image_urls_from_supabase(fetch_limit)
+            if not all_urls:
+                break
+
+            fresh_urls = []
+            for url in all_urls:
+                if not await image_url_is_seen(client, url):
+                    fresh_urls.append(url)
+                else:
+                    print(f"[Redis] skip (seen image): {url}")
+
+            if len(fresh_urls) >= images_needed:
+                break
+
+            # Not enough fresh URLs — expand the fetch window
+            if fetch_limit >= len(all_urls):
+                # Supabase returned fewer rows than we asked for — no more to fetch
+                break
+            fetch_limit = min(fetch_limit * 2, 200)
+
+    print(f"[Redis] {len(fresh_urls)} fresh image URL(s) found")
+    return fresh_urls[:images_needed + 5]  # small buffer for download failures
+
+
 async def download_image(url: str, client: httpx.AsyncClient) -> Image.Image | None:
     try:
         r = await client.get(url, timeout=15, follow_redirects=True)
@@ -323,25 +376,12 @@ async def download_image(url: str, client: httpx.AsyncClient) -> Image.Image | N
 # ─── Audio generation ─────────────────────────────────────────────────────────
 
 def generate_tts_audio(text: str, output_mp3: str, lang: str = "en") -> bool:
-    """
-    Generate TTS audio using gTTS.
-
-    Parameters
-    ----------
-    text       : The text to speak.
-    output_mp3 : Destination .mp3 path.
-    lang       : BCP-47 / gTTS language code, e.g. "en", "hi", "es".
-                 Defaults to "en" if the provided code is unsupported.
-    """
     try:
         from gtts import gTTS, lang as gtts_lang
-
-        # Validate: fall back to English if the code isn't recognised
         available = gtts_lang.tts_langs()
         if lang not in available:
             print(f"[TTS] Language '{lang}' not supported by gTTS — falling back to 'en'")
             lang = "en"
-
         tts = gTTS(text=text, lang=lang, slow=False)
         tts.save(output_mp3)
         return True
@@ -402,10 +442,6 @@ def create_photo_essay_video(
     output_path: str,
     lang: str = "en",
 ):
-    """
-    Photo-essay video with Ken Burns effect on the top image panel.
-    `lang` is used to select the correct font for rendering.
-    """
     font             = find_font(FONT_SIZE, lang)
     frames_per_word  = max(1, round(FPS * 60.0 / wpm))
     frames_per_image = round(FPS * IMG_DURATION)
@@ -551,7 +587,6 @@ async def process_photo_essay(
 
     total_seconds = len(raw_words) / rate * 60
     images_needed = max(1, math.ceil(total_seconds / IMG_DURATION))
-    fetch_limit   = min(images_needed + 5, 50)
 
     print(
         f"[/photo-essay] {len(raw_words)} words @ {rate} wpm → {total_seconds:.1f}s "
@@ -559,26 +594,45 @@ async def process_photo_essay(
         f"audio_lang={audio_lang} | display_lang={display_lang}"
     )
 
-    image_urls = await fetch_image_urls_from_supabase(fetch_limit)
+    # ── Fetch only fresh (never-seen) image URLs ──────────────────────────────
+    image_urls = await fetch_fresh_image_urls(images_needed)
+
     if not image_urls:
-        print("[/photo-essay] No images — falling back to plain essay")
+        print("[/photo-essay] No fresh images — falling back to plain essay")
         await process_essay(words_text, rate, audio, phrase_mode, audio_lang, display_lang)
         return
 
+    # ── Download images concurrently ──────────────────────────────────────────
     sem = asyncio.Semaphore(4)
     async def guarded(url, client):
         async with sem:
-            return await download_image(url, client)
+            return url, await download_image(url, client)
 
     async with httpx.AsyncClient(timeout=20) as session:
         results = await asyncio.gather(*[guarded(u, session) for u in image_urls])
 
-    images = [im for im in results if im is not None]
+    # Separate successful downloads; track which URLs downloaded OK
+    images: list[Image.Image] = []
+    successfully_downloaded_urls: list[str] = []
+    for url, im in results:
+        if im is not None:
+            images.append(im)
+            successfully_downloaded_urls.append(url)
+
     if not images:
         print("[/photo-essay] All downloads failed — falling back to plain essay")
         await process_essay(words_text, rate, audio, phrase_mode, audio_lang, display_lang)
         return
 
+    # ── Mark successfully used image URLs as seen in Redis ────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=10) as redis_client:
+            await mark_image_urls_seen(redis_client, successfully_downloaded_urls)
+        print(f"[Redis] Marked {len(successfully_downloaded_urls)} image URL(s) as seen")
+    except Exception as e:
+        print(f"[Redis] mark-seen failed (non-fatal): {e}")
+
+    # Tile images if we don't have enough
     while len(images) < images_needed:
         images = (images * 2)[:images_needed]
 
@@ -635,7 +689,7 @@ async def essay_endpoint(
     want_audio   = audio.strip().lower()  == "t"
     phrase_mode  = phrase.strip().lower() == "t"
     audio_lang   = audiochoice.strip().lower() or DEFAULT_AUDIO_LANG
-    display_lang = displaylang.strip().lower() or audio_lang  # default to audiochoice
+    display_lang = displaylang.strip().lower() or audio_lang
 
     if audio_lang not in SUPPORTED_AUDIO_LANGS:
         return JSONResponse(
@@ -682,7 +736,7 @@ async def photo_essay_endpoint(
     want_audio   = audio.strip().lower()  == "t"
     phrase_mode  = phrase.strip().lower() == "t"
     audio_lang   = audiochoice.strip().lower() or DEFAULT_AUDIO_LANG
-    display_lang = displaylang.strip().lower() or audio_lang  # default to audiochoice
+    display_lang = displaylang.strip().lower() or audio_lang
 
     if audio_lang not in SUPPORTED_AUDIO_LANGS:
         return JSONResponse(
