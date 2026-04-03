@@ -162,6 +162,34 @@ def find_font(size: int, lang: str = "en") -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
+def find_fitting_font(
+    text: str,
+    lang: str,
+    panel_w: int,
+    max_size: int = FONT_SIZE,
+    min_size: int = 24,
+    padding: int = 40,
+) -> ImageFont.FreeTypeFont:
+    """
+    Return the largest font (starting from max_size, stepping down by 4px)
+    that makes `text` fit within panel_w minus horizontal padding.
+    Falls back to min_size if nothing fits.
+    """
+    available_w = panel_w - padding * 2
+    size = max_size
+    while size >= min_size:
+        font = find_font(size, lang)
+        # Measure using a throw-away draw surface
+        dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        bbox = dummy.textbbox((0, 0), text, font=font)
+        text_w = bbox[2] - bbox[0]
+        if text_w <= available_w:
+            return font
+        size -= 4
+    # Last resort: return font at min_size even if it still overflows
+    return find_font(min_size, lang)
+
+
 def _tw(draw, text, font) -> int:
     if not text:
         return 0
@@ -176,11 +204,14 @@ def _th(draw, font) -> int:
 
 # ─── Word-panel renderer ──────────────────────────────────────────────────────
 
-def render_word_panel(word: str, font, panel_w: int, panel_h: int) -> Image.Image:
+def render_word_panel(word: str, font, panel_w: int, panel_h: int, lang: str = "en") -> Image.Image:
     img  = Image.new("RGB", (panel_w, panel_h), BG_COLOR)
     draw = ImageDraw.Draw(img)
 
+    # For phrases, auto-shrink the font so the full text fits horizontally
     is_phrase = " " in word
+    if is_phrase:
+        font = find_fitting_font(word, lang, panel_w, max_size=font.size if hasattr(font, "size") else FONT_SIZE)
 
     if is_phrase:
         tokens = word.split()
@@ -255,8 +286,8 @@ def render_word_panel(word: str, font, panel_w: int, panel_h: int) -> Image.Imag
     return img
 
 
-def render_word_frame_full(word: str, font) -> Image.Image:
-    return render_word_panel(word, font, WIDTH, HEIGHT)
+def render_word_frame_full(word: str, font, lang: str = "en") -> Image.Image:
+    return render_word_panel(word, font, WIDTH, HEIGHT, lang)
 
 
 # ─── Image utilities ──────────────────────────────────────────────────────────
@@ -429,7 +460,7 @@ def create_video(words: list[str], wpm: int, output_path: str, lang: str = "en")
     frames_per_word = max(1, round(FPS * 60.0 / wpm))
     writer          = _cv2_writer(output_path)
     for word in words:
-        bgr = _pil_to_bgr(render_word_frame_full(word, font))
+        bgr = _pil_to_bgr(render_word_frame_full(word, font, lang))
         for _ in range(frames_per_word):
             writer.write(bgr)
     writer.release()
@@ -452,7 +483,7 @@ def create_photo_essay_video(
     frame_idx = 0
 
     for word in words:
-        word_panel = render_word_panel(word, font, WIDTH, WORD_PANEL_H)
+        word_panel = render_word_panel(word, font, WIDTH, WORD_PANEL_H, lang)
 
         for f in range(frames_per_word):
             abs_frame      = frame_idx + f
