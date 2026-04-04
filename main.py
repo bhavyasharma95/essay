@@ -25,21 +25,27 @@ RED_COLOR    = (220, 50, 50)
 FONT_SIZE    = 72
 
 # Layout for /photo-essay
-IMG_PANEL_H  = int(HEIGHT * 2 / 3)   # 853 px — top image area
-WORD_PANEL_H = HEIGHT - IMG_PANEL_H  # 427 px — bottom word area
-IMG_DURATION = 2.0                    # seconds per image
+IMG_PANEL_H  = int(HEIGHT * 2 / 3)
+WORD_PANEL_H = HEIGHT - IMG_PANEL_H
+IMG_DURATION = 2.0
 
-# Ken Burns: zoom range (1.0 = no zoom, 1.08 = 8% zoom-in over the image duration)
 KB_ZOOM_START = 1.0
 KB_ZOOM_END   = 1.08
 
 # ─── /day endpoint constants ──────────────────────────────────────────────────
-DAY_YELLOW       = (255, 204, 0)       # gold/yellow from the design
-DAY_BG           = (0, 0, 0)           # black background
-DAY_FRAMES_WORD  = FPS * 2             # 2 seconds per word/token
-DAY_FONT_LARGE   = 160                 # font size for month+day token
-DAY_FONT_MEDIUM  = 110                 # font size for year token
-DAY_FONT_SMALL   = 72                  # font size for all other tokens
+DAY_YELLOW        = (255, 204, 0)
+DAY_BG            = (0, 0, 0)
+DAY_REVEAL_SEC    = 3.0          # total seconds for all elements to reveal
+DAY_HOLD_SEC      = 1.5          # seconds to hold on completed frame
+DAY_REVEAL_FRAMES = int(DAY_REVEAL_SEC * FPS)   # 90 frames
+DAY_HOLD_FRAMES   = int(DAY_HOLD_SEC  * FPS)    # 45 frames
+DAY_TOTAL_FRAMES  = DAY_REVEAL_FRAMES + DAY_HOLD_FRAMES
+
+# Font sizes for /day
+DAY_FS_LABEL      = 52    # "Today is"
+DAY_FS_DATE       = 160   # "April 4"
+DAY_FS_YEAR       = 110   # "2026"
+DAY_FS_TAGLINE    = 72    # tagline lines
 
 # ─── Upstash Redis key ────────────────────────────────────────────────────────
 REDIS_SEEN_IMAGES_KEY = "photo_essay:seen_image_urls"
@@ -77,7 +83,6 @@ def _upstash_headers() -> dict:
     }
 
 async def image_url_is_seen(client: httpx.AsyncClient, url: str) -> bool:
-    """Return True if this image URL was used in a previous job."""
     try:
         encoded_url = urllib.parse.quote(url, safe="")
         r = await client.post(
@@ -88,10 +93,9 @@ async def image_url_is_seen(client: httpx.AsyncClient, url: str) -> bool:
         return r.json().get("result") == 1
     except Exception as e:
         print(f"[Redis] sismember error (non-fatal): {e}")
-        return False  # fail open — treat as unseen
+        return False
 
 async def mark_image_urls_seen(client: httpx.AsyncClient, urls: list[str]) -> None:
-    """Add all image URLs to the persistent seen-set via a single SADD call."""
     if not urls:
         return
     try:
@@ -152,7 +156,7 @@ def find_font(size: int, lang: str = "en") -> ImageFont.FreeTypeFont:
         ]
     elif lang in other_indic:
         candidates = [
-            f"/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
             "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
@@ -449,7 +453,6 @@ def _cv2_writer(path: str):
 
 
 def create_video(words: list[str], wpm: int, output_path: str, lang: str = "en"):
-    """Plain RSVP video — no images, no Ken Burns."""
     font            = find_font(FONT_SIZE, lang)
     frames_per_word = max(1, round(FPS * 60.0 / wpm))
     writer          = _cv2_writer(output_path)
@@ -688,90 +691,155 @@ async def process_photo_essay(
                 pass
 
 
-# ─── /day endpoint: frame renderer ───────────────────────────────────────────
+# ─── /day: layout helpers ─────────────────────────────────────────────────────
 
-def render_day_frame(token: str, token_type: str) -> Image.Image:
-    """
-    Render a single full-screen frame for the /day video.
-
-    token_type is one of:
-        "today_is"   → small yellow label  "Today is"
-        "month_day"  → large yellow text   "April 4"
-        "year"       → medium yellow text  "2026"
-        "tagline"    → small yellow text   one word of the tagline
-    """
-    img  = Image.new("RGB", (WIDTH, HEIGHT), DAY_BG)
-    draw = ImageDraw.Draw(img)
-
-    if token_type == "month_day":
-        font_size = DAY_FONT_LARGE
-    elif token_type == "year":
-        font_size = DAY_FONT_MEDIUM
-    else:
-        font_size = DAY_FONT_SMALL
-
-    # Auto-shrink if the token is wide (e.g. long month names)
-    font = find_fitting_font(token, "en", WIDTH, max_size=font_size, padding=60)
-
+def _measure_text(text: str, font) -> tuple[int, int]:
+    """Return (width, height) of text rendered with font."""
     dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    bb    = dummy.textbbox((0, 0), token, font=font)
-    tw    = bb[2] - bb[0]
-    th    = bb[3] - bb[1]
+    bb = dummy.textbbox((0, 0), text, font=font)
+    return bb[2] - bb[0], bb[3] - bb[1]
 
-    x = (WIDTH  - tw) // 2
-    y = (HEIGHT - th) // 2
 
-    draw.text((x, y), token, font=font, fill=DAY_YELLOW)
+def _build_day_layout() -> list[dict]:
+    """
+    Pre-compute every element's text, font, and final (x, y) position
+    for the /day frame.  Returns a list of element dicts ordered top→bottom.
+
+    Elements (matching the reference image):
+        0  "Today is"                    — small label
+        1  "April 4"  (month + day)      — large
+        2  "2026"                        — medium
+        3  gap
+        4  "And this  daily"             — tagline line 1   (two words)
+        5  "market briefing"             — tagline line 2
+        6  "for those who"               — tagline line 3
+        7  "play to win."                — tagline line 4
+
+    Layout is calculated once and cached so every frame render is cheap.
+    """
+    today      = date.today()
+    month_day  = f"{today.strftime('%B')} {today.day}"   # e.g. "April 4"
+    year_str   = str(today.year)
+
+    font_label   = find_fitting_font("Today is",   "en", WIDTH, max_size=DAY_FS_LABEL,   padding=80)
+    font_date    = find_fitting_font(month_day,     "en", WIDTH, max_size=DAY_FS_DATE,    padding=60)
+    font_year    = find_fitting_font(year_str,      "en", WIDTH, max_size=DAY_FS_YEAR,    padding=80)
+    font_tagline = find_fitting_font("market briefing", "en", WIDTH, max_size=DAY_FS_TAGLINE, padding=60)
+
+    tagline_lines = [
+        "And this  daily",
+        "market briefing",
+        "for those who",
+        "play to win.",
+    ]
+
+    LINE_GAP   = 18   # px between consecutive lines
+    BLOCK_GAP  = 70   # px between date-block and tagline-block
+
+    # Measure all elements
+    elements = []
+    for text, font in [
+        ("Today is",  font_label),
+        (month_day,   font_date),
+        (year_str,    font_year),
+    ]:
+        w, h = _measure_text(text, font)
+        elements.append({"text": text, "font": font, "w": w, "h": h})
+
+    tagline_elems = []
+    for line in tagline_lines:
+        w, h = _measure_text(line, font_tagline)
+        tagline_elems.append({"text": line, "font": font_tagline, "w": w, "h": h})
+
+    # Total height of date block
+    date_block_h = sum(e["h"] for e in elements) + LINE_GAP * (len(elements) - 1)
+    # Total height of tagline block
+    tag_block_h  = sum(e["h"] for e in tagline_elems) + LINE_GAP * (len(tagline_elems) - 1)
+    # Grand total content height
+    total_h = date_block_h + BLOCK_GAP + tag_block_h
+
+    # Vertically centre the whole block (leave room for logo at bottom)
+    LOGO_RESERVE = 200
+    usable_h = HEIGHT - LOGO_RESERVE
+    y_start  = (usable_h - total_h) // 2
+
+    # Assign y positions to each element
+    y = y_start
+    for elem in elements:
+        elem["x"] = (WIDTH - elem["w"]) // 2
+        elem["y"] = y
+        y += elem["h"] + LINE_GAP
+
+    y += BLOCK_GAP - LINE_GAP   # replace last LINE_GAP with BLOCK_GAP
+
+    for elem in tagline_elems:
+        elem["x"] = (WIDTH - elem["w"]) // 2
+        elem["y"] = y
+        y += elem["h"] + LINE_GAP
+
+    all_elements = elements + tagline_elems
+    return all_elements
+
+
+# Cache layout per calendar date so we don't rebuild on every frame
+_day_layout_cache: dict = {}
+
+def get_day_layout() -> list[dict]:
+    today = date.today().isoformat()
+    if today not in _day_layout_cache:
+        _day_layout_cache.clear()
+        _day_layout_cache[today] = _build_day_layout()
+    return _day_layout_cache[today]
+
+
+def render_day_frame_at(visible_count: int) -> Image.Image:
+    """
+    Render a /day frame showing the first `visible_count` elements.
+    visible_count=0 → blank frame, visible_count=len(layout) → fully revealed.
+    """
+    layout = get_day_layout()
+    img    = Image.new("RGB", (WIDTH, HEIGHT), DAY_BG)
+    draw   = ImageDraw.Draw(img)
+
+    for i, elem in enumerate(layout):
+        if i >= visible_count:
+            break
+        draw.text((elem["x"], elem["y"]), elem["text"], font=elem["font"], fill=DAY_YELLOW)
+
     return img
 
 
-def build_day_tokens() -> list[tuple[str, str]]:
-    """
-    Return an ordered list of (token_text, token_type) pairs for today's date.
-
-    Sequence:
-        "Today is"   → shown as one card
-        "April 4"    → month + day on one card (large)
-        "2026"       → year on its own card (medium)
-        then one card per word of the tagline
-    """
-    today      = date.today()
-    month_name = today.strftime("%B")          # e.g. "April"
-    day_num    = str(today.day)                # e.g. "4"  (no leading zero)
-    year_str   = str(today.year)              # e.g. "2026"
-
-    tagline_words = [
-        "Your", "daily", "market", "briefing",
-        "for", "those", "who", "play", "to", "win.",
-    ]
-
-    tokens: list[tuple[str, str]] = []
-    tokens.append(("Today is", "today_is"))
-    tokens.append((f"{month_name} {day_num}", "month_day"))
-    tokens.append((year_str, "year"))
-    for w in tagline_words:
-        tokens.append((w, "tagline"))
-
-    return tokens
-
+# ─── /day video builder ───────────────────────────────────────────────────────
 
 def create_day_video(output_path: str) -> None:
-    """Build the /day intro video — 2 seconds per token, all yellow on black."""
-    tokens  = build_day_tokens()
-    writer  = _cv2_writer(output_path)
-    frames  = DAY_FRAMES_WORD          # 2 s × 30 fps = 60 frames per token
+    """
+    Build the /day intro video:
+      - 3 seconds of reveal animation (elements pop in top→bottom, evenly timed)
+      - 1.5 seconds hold on the fully-revealed frame
+    Total ≈ 4.5 seconds.
+    """
+    layout       = get_day_layout()
+    n_elements   = len(layout)
+    writer       = _cv2_writer(output_path)
 
-    for token_text, token_type in tokens:
-        frame_img = render_day_frame(token_text, token_type)
-        bgr       = _pil_to_bgr(frame_img)
-        for _ in range(frames):
-            writer.write(bgr)
+    # Each element gets an equal share of the reveal window
+    frames_per_elem = DAY_REVEAL_FRAMES / n_elements   # may be fractional
+
+    for frame_idx in range(DAY_TOTAL_FRAMES):
+        if frame_idx < DAY_REVEAL_FRAMES:
+            # How many elements should be visible at this frame?
+            visible = int(frame_idx / frames_per_elem) + 1
+            visible = min(visible, n_elements)
+        else:
+            visible = n_elements   # hold phase — everything visible
+
+        img = render_day_frame_at(visible)
+        writer.write(_pil_to_bgr(img))
 
     writer.release()
 
 
 async def process_day():
-    """Background task: build the day video and send it to Telegram."""
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         video_path = tmp.name
 
@@ -895,17 +963,19 @@ async def photo_essay_endpoint(
 @app.get("/day")
 async def day_endpoint(background_tasks: BackgroundTasks):
     """
-    Generate a daily intro video with today's date and the market briefing tagline.
-    Each token (Today is / Month Day / Year / tagline words) is shown for 2 seconds.
-    All text is gold/yellow on black. Sent to Telegram when ready.
+    Generate a daily intro video. Elements reveal top-to-bottom over 3 seconds,
+    then hold on the complete frame for 1.5 seconds. Sent to Telegram when ready.
     """
     today = date.today()
     background_tasks.add_task(process_day)
     return {
-        "status":  "processing",
-        "endpoint": "/day",
-        "date":    today.isoformat(),
-        "message": "Day intro video being generated — check Telegram shortly.",
+        "status":           "processing",
+        "endpoint":         "/day",
+        "date":             today.isoformat(),
+        "reveal_seconds":   DAY_REVEAL_SEC,
+        "hold_seconds":     DAY_HOLD_SEC,
+        "total_seconds":    DAY_REVEAL_SEC + DAY_HOLD_SEC,
+        "message":          "Day intro video being generated — check Telegram shortly.",
     }
 
 
