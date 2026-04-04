@@ -6,6 +6,7 @@ import httpx
 import asyncio
 import io
 import urllib.parse
+from datetime import date
 from fastapi import FastAPI, Query, BackgroundTasks
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageDraw, ImageFont
@@ -31,6 +32,14 @@ IMG_DURATION = 2.0                    # seconds per image
 # Ken Burns: zoom range (1.0 = no zoom, 1.08 = 8% zoom-in over the image duration)
 KB_ZOOM_START = 1.0
 KB_ZOOM_END   = 1.08
+
+# ─── /day endpoint constants ──────────────────────────────────────────────────
+DAY_YELLOW       = (255, 204, 0)       # gold/yellow from the design
+DAY_BG           = (0, 0, 0)           # black background
+DAY_FRAMES_WORD  = FPS * 2             # 2 seconds per word/token
+DAY_FONT_LARGE   = 160                 # font size for month+day token
+DAY_FONT_MEDIUM  = 110                 # font size for year token
+DAY_FONT_SMALL   = 72                  # font size for all other tokens
 
 # ─── Upstash Redis key ────────────────────────────────────────────────────────
 REDIS_SEEN_IMAGES_KEY = "photo_essay:seen_image_urls"
@@ -170,23 +179,16 @@ def find_fitting_font(
     min_size: int = 24,
     padding: int = 40,
 ) -> ImageFont.FreeTypeFont:
-    """
-    Return the largest font (starting from max_size, stepping down by 4px)
-    that makes `text` fit within panel_w minus horizontal padding.
-    Falls back to min_size if nothing fits.
-    """
     available_w = panel_w - padding * 2
     size = max_size
     while size >= min_size:
         font = find_font(size, lang)
-        # Measure using a throw-away draw surface
         dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
         bbox = dummy.textbbox((0, 0), text, font=font)
         text_w = bbox[2] - bbox[0]
         if text_w <= available_w:
             return font
         size -= 4
-    # Last resort: return font at min_size even if it still overflows
     return find_font(min_size, lang)
 
 
@@ -208,7 +210,6 @@ def render_word_panel(word: str, font, panel_w: int, panel_h: int, lang: str = "
     img  = Image.new("RGB", (panel_w, panel_h), BG_COLOR)
     draw = ImageDraw.Draw(img)
 
-    # For phrases, auto-shrink the font so the full text fits horizontally
     is_phrase = " " in word
     if is_phrase:
         font = find_fitting_font(word, lang, panel_w, max_size=font.size if hasattr(font, "size") else FONT_SIZE)
@@ -360,11 +361,6 @@ async def fetch_image_urls_from_supabase(limit: int) -> list[str]:
 
 
 async def fetch_fresh_image_urls(images_needed: int) -> list[str]:
-    """
-    Fetch image URLs from Supabase, skipping any already seen in Redis.
-    Fetches in batches, expanding the limit until we have enough fresh URLs
-    or exhaust available images (capped at 200).
-    """
     fresh_urls: list[str] = []
     fetch_limit = min(images_needed + 10, 50)
 
@@ -384,14 +380,12 @@ async def fetch_fresh_image_urls(images_needed: int) -> list[str]:
             if len(fresh_urls) >= images_needed:
                 break
 
-            # Not enough fresh URLs — expand the fetch window
             if fetch_limit >= len(all_urls):
-                # Supabase returned fewer rows than we asked for — no more to fetch
                 break
             fetch_limit = min(fetch_limit * 2, 200)
 
     print(f"[Redis] {len(fresh_urls)} fresh image URL(s) found")
-    return fresh_urls[:images_needed + 5]  # small buffer for download failures
+    return fresh_urls[:images_needed + 5]
 
 
 async def download_image(url: str, client: httpx.AsyncClient) -> Image.Image | None:
@@ -625,7 +619,6 @@ async def process_photo_essay(
         f"audio_lang={audio_lang} | display_lang={display_lang}"
     )
 
-    # ── Fetch only fresh (never-seen) image URLs ──────────────────────────────
     image_urls = await fetch_fresh_image_urls(images_needed)
 
     if not image_urls:
@@ -633,7 +626,6 @@ async def process_photo_essay(
         await process_essay(words_text, rate, audio, phrase_mode, audio_lang, display_lang)
         return
 
-    # ── Download images concurrently ──────────────────────────────────────────
     sem = asyncio.Semaphore(4)
     async def guarded(url, client):
         async with sem:
@@ -642,7 +634,6 @@ async def process_photo_essay(
     async with httpx.AsyncClient(timeout=20) as session:
         results = await asyncio.gather(*[guarded(u, session) for u in image_urls])
 
-    # Separate successful downloads; track which URLs downloaded OK
     images: list[Image.Image] = []
     successfully_downloaded_urls: list[str] = []
     for url, im in results:
@@ -655,7 +646,6 @@ async def process_photo_essay(
         await process_essay(words_text, rate, audio, phrase_mode, audio_lang, display_lang)
         return
 
-    # ── Mark successfully used image URLs as seen in Redis ────────────────────
     try:
         async with httpx.AsyncClient(timeout=10) as redis_client:
             await mark_image_urls_seen(redis_client, successfully_downloaded_urls)
@@ -663,7 +653,6 @@ async def process_photo_essay(
     except Exception as e:
         print(f"[Redis] mark-seen failed (non-fatal): {e}")
 
-    # Tile images if we don't have enough
     while len(images) < images_needed:
         images = (images * 2)[:images_needed]
 
@@ -697,6 +686,110 @@ async def process_photo_essay(
                 os.remove(p)
             except Exception:
                 pass
+
+
+# ─── /day endpoint: frame renderer ───────────────────────────────────────────
+
+def render_day_frame(token: str, token_type: str) -> Image.Image:
+    """
+    Render a single full-screen frame for the /day video.
+
+    token_type is one of:
+        "today_is"   → small yellow label  "Today is"
+        "month_day"  → large yellow text   "April 4"
+        "year"       → medium yellow text  "2026"
+        "tagline"    → small yellow text   one word of the tagline
+    """
+    img  = Image.new("RGB", (WIDTH, HEIGHT), DAY_BG)
+    draw = ImageDraw.Draw(img)
+
+    if token_type == "month_day":
+        font_size = DAY_FONT_LARGE
+    elif token_type == "year":
+        font_size = DAY_FONT_MEDIUM
+    else:
+        font_size = DAY_FONT_SMALL
+
+    # Auto-shrink if the token is wide (e.g. long month names)
+    font = find_fitting_font(token, "en", WIDTH, max_size=font_size, padding=60)
+
+    dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    bb    = dummy.textbbox((0, 0), token, font=font)
+    tw    = bb[2] - bb[0]
+    th    = bb[3] - bb[1]
+
+    x = (WIDTH  - tw) // 2
+    y = (HEIGHT - th) // 2
+
+    draw.text((x, y), token, font=font, fill=DAY_YELLOW)
+    return img
+
+
+def build_day_tokens() -> list[tuple[str, str]]:
+    """
+    Return an ordered list of (token_text, token_type) pairs for today's date.
+
+    Sequence:
+        "Today is"   → shown as one card
+        "April 4"    → month + day on one card (large)
+        "2026"       → year on its own card (medium)
+        then one card per word of the tagline
+    """
+    today      = date.today()
+    month_name = today.strftime("%B")          # e.g. "April"
+    day_num    = str(today.day)                # e.g. "4"  (no leading zero)
+    year_str   = str(today.year)              # e.g. "2026"
+
+    tagline_words = [
+        "Your", "daily", "market", "briefing",
+        "for", "those", "who", "play", "to", "win.",
+    ]
+
+    tokens: list[tuple[str, str]] = []
+    tokens.append(("Today is", "today_is"))
+    tokens.append((f"{month_name} {day_num}", "month_day"))
+    tokens.append((year_str, "year"))
+    for w in tagline_words:
+        tokens.append((w, "tagline"))
+
+    return tokens
+
+
+def create_day_video(output_path: str) -> None:
+    """Build the /day intro video — 2 seconds per token, all yellow on black."""
+    tokens  = build_day_tokens()
+    writer  = _cv2_writer(output_path)
+    frames  = DAY_FRAMES_WORD          # 2 s × 30 fps = 60 frames per token
+
+    for token_text, token_type in tokens:
+        frame_img = render_day_frame(token_text, token_type)
+        bgr       = _pil_to_bgr(frame_img)
+        for _ in range(frames):
+            writer.write(bgr)
+
+    writer.release()
+
+
+async def process_day():
+    """Background task: build the day video and send it to Telegram."""
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        video_path = tmp.name
+
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, create_day_video, video_path)
+
+        if not os.path.exists(video_path):
+            print("[/day] Video file missing — aborting send")
+            return
+
+        status, body = await send_video_to_telegram(video_path)
+        print(f"[/day] Telegram {status}: {body}")
+    finally:
+        try:
+            os.remove(video_path)
+        except Exception:
+            pass
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -796,6 +889,23 @@ async def photo_essay_endpoint(
         "estimated_seconds": round(total_seconds, 1),
         "images_needed":     images_needed,
         "message":           "Photo-essay video being generated — check Telegram shortly.",
+    }
+
+
+@app.get("/day")
+async def day_endpoint(background_tasks: BackgroundTasks):
+    """
+    Generate a daily intro video with today's date and the market briefing tagline.
+    Each token (Today is / Month Day / Year / tagline words) is shown for 2 seconds.
+    All text is gold/yellow on black. Sent to Telegram when ready.
+    """
+    today = date.today()
+    background_tasks.add_task(process_day)
+    return {
+        "status":  "processing",
+        "endpoint": "/day",
+        "date":    today.isoformat(),
+        "message": "Day intro video being generated — check Telegram shortly.",
     }
 
 
