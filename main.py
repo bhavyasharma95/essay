@@ -32,6 +32,12 @@ IMG_DURATION = 2.0
 KB_ZOOM_START = 1.0
 KB_ZOOM_END   = 1.08
 
+# ─── /full endpoint constants ─────────────────────────────────────────────────
+FULL_OVERLAY_BG        = (0, 0, 0, 175)   # RGBA — semi-transparent pill background
+FULL_OVERLAY_PADDING_X = 48               # horizontal padding inside the pill
+FULL_OVERLAY_PADDING_Y = 28               # vertical padding inside the pill
+FULL_OVERLAY_RADIUS    = 24               # rounded-corner radius for the pill
+
 # ─── /day endpoint constants ──────────────────────────────────────────────────
 DAY_YELLOW        = (255, 204, 0)
 DAY_BG            = (0, 0, 0)
@@ -295,6 +301,129 @@ def render_word_frame_full(word: str, font, lang: str = "en") -> Image.Image:
     return render_word_panel(word, font, WIDTH, HEIGHT, lang)
 
 
+# ─── /full overlay renderer ───────────────────────────────────────────────────
+
+def _draw_rounded_rect_rgba(overlay: Image.Image, box: tuple, radius: int, fill: tuple) -> None:
+    """Draw a filled rounded rectangle on an RGBA image."""
+    draw = ImageDraw.Draw(overlay)
+    x0, y0, x1, y1 = box
+    draw.rounded_rectangle([x0, y0, x1, y1], radius=radius, fill=fill)
+
+
+def render_full_frame(
+    word: str,
+    font,
+    bg_image: Image.Image,
+    lang: str = "en",
+) -> Image.Image:
+    """
+    Composite a word/phrase centred over a full-screen background image.
+    The text sits on a semi-transparent rounded-rectangle pill for contrast.
+    """
+    # Start with the background (already sized to WIDTH x HEIGHT)
+    frame = bg_image.copy().convert("RGBA")
+
+    is_phrase = " " in word
+    if is_phrase:
+        font = find_fitting_font(
+            word, lang, WIDTH,
+            max_size=font.size if hasattr(font, "size") else FONT_SIZE,
+            padding=FULL_OVERLAY_PADDING_X * 2,
+        )
+
+    # Measure text
+    dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    bbox  = dummy.textbbox((0, 0), word, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+
+    # Pill dimensions
+    pill_w = text_w + FULL_OVERLAY_PADDING_X * 2
+    pill_h = text_h + FULL_OVERLAY_PADDING_Y * 2
+    pill_x = (WIDTH  - pill_w) // 2
+    pill_y = (HEIGHT - pill_h) // 2
+
+    # Draw semi-transparent pill onto a separate RGBA layer, then composite
+    overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    _draw_rounded_rect_rgba(
+        overlay,
+        (pill_x, pill_y, pill_x + pill_w, pill_y + pill_h),
+        FULL_OVERLAY_RADIUS,
+        FULL_OVERLAY_BG,
+    )
+    frame = Image.alpha_composite(frame, overlay).convert("RGB")
+
+    # Now draw the pivot-highlighted text on top
+    draw = ImageDraw.Draw(frame)
+
+    if is_phrase:
+        tokens = word.split()
+        first  = tokens[0]
+        rest   = " ".join(tokens[1:])
+
+        pivot_idx      = get_pivot_index(first)
+        alpha_count    = 0
+        pivot_char_idx = 0
+        for i, ch in enumerate(first):
+            if ch.isalpha():
+                if alpha_count == pivot_idx:
+                    pivot_char_idx = i
+                    break
+                alpha_count += 1
+
+        before     = first[:pivot_char_idx]
+        pivot_char = first[pivot_char_idx] if pivot_char_idx < len(first) else ""
+        after_word = first[pivot_char_idx + 1:] if pivot_char_idx + 1 < len(first) else ""
+        after_full = after_word + (" " + rest if rest else "")
+
+        w_b = _tw(draw, before, font)
+        w_p = _tw(draw, pivot_char, font) if pivot_char else 0
+        w_a = _tw(draw, after_full, font)
+        h   = _th(draw, font)
+
+        x = (WIDTH  - w_b - w_p - w_a) // 2
+        y = (HEIGHT - h) // 2
+
+        if before:
+            draw.text((x, y), before, font=font, fill=TEXT_COLOR);  x += w_b
+        if pivot_char:
+            draw.text((x, y), pivot_char, font=font, fill=RED_COLOR); x += w_p
+        if after_full:
+            draw.text((x, y), after_full, font=font, fill=TEXT_COLOR)
+
+    else:
+        pivot_idx      = get_pivot_index(word)
+        alpha_count    = 0
+        pivot_char_idx = 0
+        for i, ch in enumerate(word):
+            if ch.isalpha():
+                if alpha_count == pivot_idx:
+                    pivot_char_idx = i
+                    break
+                alpha_count += 1
+
+        before     = word[:pivot_char_idx]
+        pivot_char = word[pivot_char_idx] if pivot_char_idx < len(word) else ""
+        after      = word[pivot_char_idx + 1:] if pivot_char_idx + 1 < len(word) else ""
+
+        w_b = _tw(draw, before, font)
+        w_p = _tw(draw, pivot_char, font) if pivot_char else 0
+        w_a = _tw(draw, after, font)
+        h   = _th(draw, font)
+
+        x = (WIDTH  - w_b - w_p - w_a) // 2
+        y = (HEIGHT - h) // 2
+
+        if before:
+            draw.text((x, y), before, font=font, fill=TEXT_COLOR);  x += w_b
+        if pivot_char:
+            draw.text((x, y), pivot_char, font=font, fill=RED_COLOR); x += w_p
+        if after:
+            draw.text((x, y), after, font=font, fill=TEXT_COLOR)
+
+    return frame
+
+
 # ─── Image utilities ──────────────────────────────────────────────────────────
 
 def fit_image_to_panel(img: Image.Image, pw: int, ph: int) -> Image.Image:
@@ -506,6 +635,49 @@ def create_photo_essay_video(
     writer.release()
 
 
+def create_full_video(
+    words: list[str],
+    wpm: int,
+    images: list[Image.Image],
+    output_path: str,
+    lang: str = "en",
+):
+    """
+    Full-screen photo essay: image fills 720×1280, word/phrase rendered
+    centred over the image on a semi-transparent pill background.
+    """
+    font             = find_font(FONT_SIZE, lang)
+    frames_per_word  = max(1, round(FPS * 60.0 / wpm))
+    frames_per_image = round(FPS * IMG_DURATION)
+
+    # Prepare Ken Burns bases at full frame size
+    kb_bases = [_prepare_ken_burns_base(im, WIDTH, HEIGHT) for im in images]
+
+    writer    = _cv2_writer(output_path)
+    frame_idx = 0
+
+    for word in words:
+        for f in range(frames_per_word):
+            abs_frame      = frame_idx + f
+            img_idx        = (abs_frame // frames_per_image) % len(kb_bases)
+            frame_in_image = abs_frame % frames_per_image
+
+            bg = apply_ken_burns(
+                kb_bases[img_idx],
+                frame_in_image,
+                frames_per_image,
+                WIDTH,
+                HEIGHT,
+            )
+
+            composite = render_full_frame(word, font, bg, lang)
+            writer.write(_pil_to_bgr(composite))
+
+        frame_idx += frames_per_word
+
+    writer.release()
+
+
 # ─── Audio post-processing helper ─────────────────────────────────────────────
 
 def apply_audio_if_requested(
@@ -552,6 +724,41 @@ async def send_video_to_telegram(video_path: str):
                 files={"video": ("essay.mp4", f, "video/mp4")},
             )
     return resp.status_code, resp.text
+
+
+# ─── Shared image fetch + download helper ─────────────────────────────────────
+
+async def _fetch_and_download_images(
+    images_needed: int,
+    endpoint_label: str,
+) -> tuple[list[Image.Image], list[str]]:
+    """
+    Fetch fresh image URLs from Supabase/Redis, download them concurrently,
+    and return (images, successfully_downloaded_urls).
+    Returns ([], []) if nothing is available.
+    """
+    image_urls = await fetch_fresh_image_urls(images_needed)
+    if not image_urls:
+        print(f"[{endpoint_label}] No fresh images available")
+        return [], []
+
+    sem = asyncio.Semaphore(4)
+
+    async def guarded(url, client):
+        async with sem:
+            return url, await download_image(url, client)
+
+    async with httpx.AsyncClient(timeout=20) as session:
+        results = await asyncio.gather(*[guarded(u, session) for u in image_urls])
+
+    images: list[Image.Image] = []
+    downloaded_urls: list[str] = []
+    for url, im in results:
+        if im is not None:
+            images.append(im)
+            downloaded_urls.append(url)
+
+    return images, downloaded_urls
 
 
 # ─── Background task processors ───────────────────────────────────────────────
@@ -622,27 +829,7 @@ async def process_photo_essay(
         f"audio_lang={audio_lang} | display_lang={display_lang}"
     )
 
-    image_urls = await fetch_fresh_image_urls(images_needed)
-
-    if not image_urls:
-        print("[/photo-essay] No fresh images — falling back to plain essay")
-        await process_essay(words_text, rate, audio, phrase_mode, audio_lang, display_lang)
-        return
-
-    sem = asyncio.Semaphore(4)
-    async def guarded(url, client):
-        async with sem:
-            return url, await download_image(url, client)
-
-    async with httpx.AsyncClient(timeout=20) as session:
-        results = await asyncio.gather(*[guarded(u, session) for u in image_urls])
-
-    images: list[Image.Image] = []
-    successfully_downloaded_urls: list[str] = []
-    for url, im in results:
-        if im is not None:
-            images.append(im)
-            successfully_downloaded_urls.append(url)
+    images, downloaded_urls = await _fetch_and_download_images(images_needed, "/photo-essay")
 
     if not images:
         print("[/photo-essay] All downloads failed — falling back to plain essay")
@@ -651,8 +838,8 @@ async def process_photo_essay(
 
     try:
         async with httpx.AsyncClient(timeout=10) as redis_client:
-            await mark_image_urls_seen(redis_client, successfully_downloaded_urls)
-        print(f"[Redis] Marked {len(successfully_downloaded_urls)} image URL(s) as seen")
+            await mark_image_urls_seen(redis_client, downloaded_urls)
+        print(f"[Redis] Marked {len(downloaded_urls)} image URL(s) as seen")
     except Exception as e:
         print(f"[Redis] mark-seen failed (non-fatal): {e}")
 
@@ -691,6 +878,83 @@ async def process_photo_essay(
                 pass
 
 
+async def process_full(
+    words_text: str,
+    rate: int,
+    audio: bool,
+    phrase_mode: bool = False,
+    audio_lang: str = "en",
+    display_lang: str = "en",
+):
+    """
+    Full-screen photo essay processor.  Images fill 720×1280; text is
+    centred over the image on a semi-transparent rounded-rectangle pill.
+    Falls back to plain essay if no images are available.
+    """
+    raw_words = words_text.split()
+    if not raw_words:
+        return
+
+    display_units = group_into_phrases(raw_words) if phrase_mode else raw_words
+
+    total_seconds = len(raw_words) / rate * 60
+    images_needed = max(1, math.ceil(total_seconds / IMG_DURATION))
+
+    print(
+        f"[/full] {len(raw_words)} words @ {rate} wpm → {total_seconds:.1f}s "
+        f"→ need {images_needed} images | phrase_mode={phrase_mode} | "
+        f"audio_lang={audio_lang} | display_lang={display_lang}"
+    )
+
+    images, downloaded_urls = await _fetch_and_download_images(images_needed, "/full")
+
+    if not images:
+        print("[/full] No images — falling back to plain essay")
+        await process_essay(words_text, rate, audio, phrase_mode, audio_lang, display_lang)
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as redis_client:
+            await mark_image_urls_seen(redis_client, downloaded_urls)
+        print(f"[Redis] Marked {len(downloaded_urls)} image URL(s) as seen")
+    except Exception as e:
+        print(f"[Redis] mark-seen failed (non-fatal): {e}")
+
+    while len(images) < images_needed:
+        images = (images * 2)[:images_needed]
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        silent_path = tmp.name
+
+    final_path = silent_path
+    try:
+        loop = asyncio.get_event_loop()
+
+        await loop.run_in_executor(
+            None, create_full_video,
+            display_units, rate, images, silent_path, display_lang
+        )
+
+        if audio:
+            final_path = await loop.run_in_executor(
+                None, apply_audio_if_requested,
+                silent_path, words_text, True, audio_lang
+            )
+
+        if not os.path.exists(final_path):
+            print("[/full] Final video missing — aborting send")
+            return
+
+        status, body = await send_video_to_telegram(final_path)
+        print(f"[/full] Telegram {status}: {body}")
+    finally:
+        for p in {silent_path, final_path}:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+
 # ─── /day: layout helpers ─────────────────────────────────────────────────────
 
 def _measure_text(text: str, font) -> tuple[int, int]:
@@ -701,24 +965,8 @@ def _measure_text(text: str, font) -> tuple[int, int]:
 
 
 def _build_day_layout() -> list[dict]:
-    """
-    Pre-compute every element's text, font, and final (x, y) position
-    for the /day frame.  Returns a list of element dicts ordered top→bottom.
-
-    Elements (matching the reference image):
-        0  "Today is"                    — small label
-        1  "April 4"  (month + day)      — large
-        2  "2026"                        — medium
-        3  gap
-        4  "And this  daily"             — tagline line 1   (two words)
-        5  "market briefing"             — tagline line 2
-        6  "for those who"               — tagline line 3
-        7  "play to win."                — tagline line 4
-
-    Layout is calculated once and cached so every frame render is cheap.
-    """
     today      = date.today()
-    month_day  = f"{today.strftime('%B')} {today.day}"   # e.g. "April 4"
+    month_day  = f"{today.strftime('%B')} {today.day}"
     year_str   = str(today.year)
 
     font_label   = find_fitting_font("Today is",   "en", WIDTH, max_size=DAY_FS_LABEL,   padding=80)
@@ -733,10 +981,9 @@ def _build_day_layout() -> list[dict]:
         "play to win.",
     ]
 
-    LINE_GAP   = 18   # px between consecutive lines
-    BLOCK_GAP  = 70   # px between date-block and tagline-block
+    LINE_GAP   = 18
+    BLOCK_GAP  = 70
 
-    # Measure all elements
     elements = []
     for text, font in [
         ("Today is",  font_label),
@@ -751,26 +998,21 @@ def _build_day_layout() -> list[dict]:
         w, h = _measure_text(line, font_tagline)
         tagline_elems.append({"text": line, "font": font_tagline, "w": w, "h": h})
 
-    # Total height of date block
     date_block_h = sum(e["h"] for e in elements) + LINE_GAP * (len(elements) - 1)
-    # Total height of tagline block
     tag_block_h  = sum(e["h"] for e in tagline_elems) + LINE_GAP * (len(tagline_elems) - 1)
-    # Grand total content height
     total_h = date_block_h + BLOCK_GAP + tag_block_h
 
-    # Vertically centre the whole block (leave room for logo at bottom)
     LOGO_RESERVE = 200
     usable_h = HEIGHT - LOGO_RESERVE
     y_start  = (usable_h - total_h) // 2
 
-    # Assign y positions to each element
     y = y_start
     for elem in elements:
         elem["x"] = (WIDTH - elem["w"]) // 2
         elem["y"] = y
         y += elem["h"] + LINE_GAP
 
-    y += BLOCK_GAP - LINE_GAP   # replace last LINE_GAP with BLOCK_GAP
+    y += BLOCK_GAP - LINE_GAP
 
     for elem in tagline_elems:
         elem["x"] = (WIDTH - elem["w"]) // 2
@@ -781,7 +1023,6 @@ def _build_day_layout() -> list[dict]:
     return all_elements
 
 
-# Cache layout per calendar date so we don't rebuild on every frame
 _day_layout_cache: dict = {}
 
 def get_day_layout() -> list[dict]:
@@ -793,10 +1034,6 @@ def get_day_layout() -> list[dict]:
 
 
 def render_day_frame_at(visible_count: int) -> Image.Image:
-    """
-    Render a /day frame showing the first `visible_count` elements.
-    visible_count=0 → blank frame, visible_count=len(layout) → fully revealed.
-    """
     layout = get_day_layout()
     img    = Image.new("RGB", (WIDTH, HEIGHT), DAY_BG)
     draw   = ImageDraw.Draw(img)
@@ -812,26 +1049,18 @@ def render_day_frame_at(visible_count: int) -> Image.Image:
 # ─── /day video builder ───────────────────────────────────────────────────────
 
 def create_day_video(output_path: str) -> None:
-    """
-    Build the /day intro video:
-      - 3 seconds of reveal animation (elements pop in top→bottom, evenly timed)
-      - 1.5 seconds hold on the fully-revealed frame
-    Total ≈ 4.5 seconds.
-    """
     layout       = get_day_layout()
     n_elements   = len(layout)
     writer       = _cv2_writer(output_path)
 
-    # Each element gets an equal share of the reveal window
-    frames_per_elem = DAY_REVEAL_FRAMES / n_elements   # may be fractional
+    frames_per_elem = DAY_REVEAL_FRAMES / n_elements
 
     for frame_idx in range(DAY_TOTAL_FRAMES):
         if frame_idx < DAY_REVEAL_FRAMES:
-            # How many elements should be visible at this frame?
             visible = int(frame_idx / frames_per_elem) + 1
             visible = min(visible, n_elements)
         else:
-            visible = n_elements   # hold phase — everything visible
+            visible = n_elements
 
         img = render_day_frame_at(visible)
         writer.write(_pil_to_bgr(img))
@@ -957,6 +1186,63 @@ async def photo_essay_endpoint(
         "estimated_seconds": round(total_seconds, 1),
         "images_needed":     images_needed,
         "message":           "Photo-essay video being generated — check Telegram shortly.",
+    }
+
+
+@app.get("/full")
+async def full_endpoint(
+    background_tasks: BackgroundTasks,
+    words:       str = Query(...,   description="Essay text (URL-encoded, supports Unicode/Hindi)"),
+    rate:        int = Query(300,   description="Words per minute (50–1000)"),
+    audio:       str = Query("f",   description="Add voiceover? t=yes, f=no"),
+    phrase:      str = Query("f",   description="Phrase mode (2–3 words at a time)? t=yes, f=no"),
+    audiochoice: str = Query("en",  description="gTTS language code for voiceover, e.g. en, hi, es, fr"),
+    displaylang: str = Query("",    description="Font language for rendering text, e.g. en, hi (defaults to audiochoice)"),
+):
+    """
+    Full-screen photo essay.  Images fill the entire 720×1280 frame with a
+    Ken Burns zoom effect.  Each word/phrase is rendered centred over the image
+    on a semi-transparent dark pill so the text is always readable.
+    Falls back to plain /essay if no images are available.
+    """
+    if not 50 <= rate <= 1000:
+        return JSONResponse(status_code=400, content={"error": "rate must be 50–1000"})
+    word_list = words.split()
+    if not word_list:
+        return JSONResponse(status_code=400, content={"error": "No words provided"})
+
+    want_audio   = audio.strip().lower()  == "t"
+    phrase_mode  = phrase.strip().lower() == "t"
+    audio_lang   = audiochoice.strip().lower() or DEFAULT_AUDIO_LANG
+    display_lang = displaylang.strip().lower() or audio_lang
+
+    if audio_lang not in SUPPORTED_AUDIO_LANGS:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"audiochoice '{audio_lang}' not in supported list.",
+                "supported": SUPPORTED_AUDIO_LANGS,
+            },
+        )
+
+    total_seconds = len(word_list) / rate * 60
+    images_needed = max(1, math.ceil(total_seconds / IMG_DURATION))
+
+    background_tasks.add_task(
+        process_full, words, rate, want_audio, phrase_mode, audio_lang, display_lang
+    )
+    return {
+        "status":            "processing",
+        "endpoint":          "/full",
+        "word_count":        len(word_list),
+        "rate_wpm":          rate,
+        "audio":             want_audio,
+        "audio_lang":        audio_lang,
+        "display_lang":      display_lang,
+        "phrase_mode":       phrase_mode,
+        "estimated_seconds": round(total_seconds, 1),
+        "images_needed":     images_needed,
+        "message":           "Full-screen essay video being generated — check Telegram shortly.",
     }
 
 
