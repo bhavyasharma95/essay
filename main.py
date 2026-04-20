@@ -475,10 +475,12 @@ def _prepare_ken_burns_base(img: Image.Image, pw: int, ph: int) -> Image.Image:
     return img.resize((nw, nh), Image.LANCZOS)
 
 
+# ─── FIX 1: Supabase query now excludes "no_image" at the DB level,
+#            and the return statement validates URLs start with "http".
 async def fetch_image_urls_from_supabase(limit: int) -> list[str]:
     url = (
         f"{settings.SUPABASE_URL}/rest/v1/news"
-        f"?select=image&image=not.is.null&image=neq."
+        f"?select=image&image=not.is.null&image=neq.&image=neq.no_image"
         f"&order=created_at.desc&limit={limit}"
     )
     headers = {
@@ -490,7 +492,11 @@ async def fetch_image_urls_from_supabase(limit: int) -> list[str]:
     if resp.status_code != 200:
         print(f"Supabase error {resp.status_code}: {resp.text}")
         return []
-    return [r["image"] for r in resp.json() if r.get("image")]
+    # FIX 2: Only return values that look like real HTTP(S) URLs
+    return [
+        r["image"] for r in resp.json()
+        if r.get("image") and str(r["image"]).startswith("http")
+    ]
 
 
 async def fetch_fresh_image_urls(images_needed: int) -> list[str]:
